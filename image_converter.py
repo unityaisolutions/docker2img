@@ -29,11 +29,16 @@ class ImageConverter:
         
     def cleanup(self):
         """Clean up temporary directories and loop devices."""
-        # Detach loop devices
+        # Remove device-mapper mappings then detach loop devices
         for loop_device in self.loop_devices:
             try:
-                subprocess.run(['sudo', 'losetup', '-d', loop_device], 
-                             check=False, capture_output=True)
+                subprocess.run(['sudo', 'kpartx', '-d', loop_device],
+                               check=False, capture_output=True, text=True)
+            except:
+                pass
+            try:
+                subprocess.run(['sudo', 'losetup', '-d', loop_device],
+                               check=False, capture_output=True, text=True)
             except:
                 pass
         
@@ -116,7 +121,7 @@ class ImageConverter:
         
         for attempt in range(max_retries):
             try:
-                result = self.run_command(['sudo', 'losetup', '--find', '--show', disk_path])
+                result = self.run_command(['sudo', 'losetup', '--find', '--show', '--partscan', disk_path])
                 loop_device = result.stdout.strip()
                 
                 if loop_device and os.path.exists(loop_device):
@@ -148,6 +153,19 @@ class ImageConverter:
         # Inform kernel about partition changes
         print(f"DEBUG: Running partprobe on {loop_device}")
         self.run_command(['sudo', 'partprobe', loop_device])
+        # Also request kernel to reread partition table and wait for udev
+        print(f"DEBUG: Forcing partition table reread on {loop_device}")
+        self.run_command(['sudo', 'blockdev', '--rereadpt', loop_device], check=False)
+        print("DEBUG: Waiting for udev to settle")
+        self.run_command(['sudo', 'udevadm', 'settle'], check=False)
+
+        # Additional helpers: partx and kpartx mappings
+        print("DEBUG: Updating kernel partition table with partx")
+        self.run_command(['sudo', 'partx', '-u', loop_device], check=False)
+        print("DEBUG: Creating device-mapper partition maps with kpartx")
+        self.run_command(['sudo', 'kpartx', '-a', '-s', loop_device], check=False)
+        print("DEBUG: Waiting for udev to settle after kpartx")
+        self.run_command(['sudo', 'udevadm', 'settle'], check=False)
 
         # Additional verification after partitioning
         print(f"DEBUG: Verifying partition was created")
@@ -218,25 +236,84 @@ class ImageConverter:
         except Exception as e:
             print(f"ERROR: partprobe failed: {e}")
 
+        # Attempt to create DM mappings via kpartx and check mapper path
+        mapper_partition = f"/dev/mapper/{os.path.basename(loop_device)}p1"
+        try:
+            print("DEBUG: Invoking kpartx to create device-mapper nodes")
+            subprocess.run(['sudo', 'kpartx', '-a', '-s', loop_device], check=False, capture_output=True, text=True)
+            subprocess.run(['sudo', 'udevadm', 'settle'], check=False, capture_output=True, text=True)
+        except Exception as e:
+            print(f"DEBUG: kpartx invocation failed: {e}")
+        if os.path.exists(mapper_partition):
+            print(f"DEBUG: Found mapper partition device: {mapper_partition}")
+            partition_device = mapper_partition
+            self.run_command(['sudo', 'mkfs.ext4', '-F', partition_device])
+            return partition_device
+
         # Wait for partition device to appear with more detailed logging
         print(f"DEBUG: Waiting for partition device {partition_device} to appear...")
-        max_attempts = 15  # Increased from 10 to 15 seconds
+        max_attempts = 60  # Allow up to 60 seconds across slow environments
+        detected_partition = None
         for i in range(max_attempts):
             print(f"DEBUG: Attempt {i+1}/{max_attempts}: Checking for {partition_device}")
+
+            # Direct path check
             if os.path.exists(partition_device):
-                print(f"DEBUG: SUCCESS! Partition device appeared after {i+1} seconds")
+                detected_partition = partition_device
+                print(f"DEBUG: SUCCESS! Partition device appeared after {i+1} seconds at {detected_partition}")
                 break
 
-            # Check if any partition devices exist for this loop device
+            # Direct mapper path check
+            if os.path.exists(mapper_partition):
+                detected_partition = mapper_partition
+                print(f"DEBUG: SUCCESS! Mapper partition appeared after {i+1} seconds at {detected_partition}")
+                break
+
+            # Discover via lsblk in case the partition name differs
+            try:
+                lsblk = subprocess.run(
+                    ['lsblk', '-ln', '-o', 'PATH,TYPE', loop_device],
+                    capture_output=True, text=True
+                )
+                print(f"DEBUG: lsblk output:\n{lsblk.stdout}")
+                for line in lsblk.stdout.strip().splitlines():
+                    parts = line.strip().split()
+                    if len(parts) == 2 and parts[1] == 'part':
+                        candidate = parts[0]
+                        if os.path.exists(candidate):
+                            detected_partition = candidate
+                            print(f"DEBUG: Discovered partition via lsblk: {detected_partition}")
+                            break
+                if detected_partition:
+                    break
+            except Exception as e:
+                print(f"DEBUG: lsblk check failed: {e}")
+
+            # Check if any partition devices exist for this loop device by glob pattern
             try:
                 ls_result = subprocess.run(['ls', '-la', f"{loop_device}p*"],
-                                         capture_output=True, text=True)
+                                           capture_output=True, text=True)
                 if ls_result.stdout.strip():
-                    print(f"DEBUG: Found partition devices:\n{ls_result.stdout}")
+                    print(f"DEBUG: Found partition devices via glob:\n{ls_result.stdout}")
                 else:
-                    print(f"DEBUG: No partition devices found yet")
-            except:
-                pass
+                    print("DEBUG: No partition devices found yet via glob")
+            except Exception as e:
+                print(f"DEBUG: Glob check failed: {e}")
+
+            # Periodically nudge the kernel and wait for udev
+            if i == 0 or (i + 1) % 5 == 0:
+                try:
+                    print(f"DEBUG: Re-triggering partition table scan on {loop_device}")
+                    subprocess.run(['sudo', 'blockdev', '--rereadpt', loop_device],
+                                   check=False, capture_output=True, text=True)
+                    subprocess.run(['sudo', 'partprobe', loop_device],
+                                   check=False, capture_output=True, text=True)
+                    subprocess.run(['sudo', 'kpartx', '-a', '-s', loop_device],
+                                   check=False, capture_output=True, text=True)
+                    subprocess.run(['sudo', 'udevadm', 'settle'],
+                                   check=False, capture_output=True, text=True)
+                except Exception as e:
+                    print(f"DEBUG: Re-triggering scan failed: {e}")
 
             time.sleep(1)
         else:
@@ -247,7 +324,7 @@ class ImageConverter:
             try:
                 print("DEBUG: Checking /dev/loop* devices:")
                 ls_dev_result = subprocess.run(['ls', '-la', '/dev/loop*'],
-                                             capture_output=True, text=True)
+                                               capture_output=True, text=True)
                 print(ls_dev_result.stdout)
             except:
                 pass
@@ -255,17 +332,43 @@ class ImageConverter:
             try:
                 print("DEBUG: Checking /proc/partitions:")
                 cat_result = subprocess.run(['cat', '/proc/partitions'],
-                                          capture_output=True, text=True)
+                                            capture_output=True, text=True)
                 print(cat_result.stdout)
+            except:
+                pass
+
+            try:
+                print("DEBUG: lsblk --all:")
+                lsblk_all = subprocess.run(['lsblk', '-a'], capture_output=True, text=True)
+                print(lsblk_all.stdout)
+            except:
+                pass
+
+            try:
+                print("DEBUG: kpartx -l output:")
+                kp = subprocess.run(['sudo', 'kpartx', '-l', loop_device], capture_output=True, text=True)
+                print((kp.stdout or '') + (kp.stderr or ''))
+            except:
+                pass
+
+            try:
+                print("DEBUG: dmsetup ls:")
+                dm = subprocess.run(['sudo', 'dmsetup', 'ls'], capture_output=True, text=True)
+                print((dm.stdout or '') + (dm.stderr or ''))
             except:
                 pass
 
             raise Exception(f"Partition device {partition_device} did not appear after {max_attempts} seconds")
 
+        # Use detected partition if it differs
+        if detected_partition:
+            partition_device = detected_partition
+
         # Format with ext4
         self.run_command([
             'sudo', 'mkfs.ext4', '-F', partition_device
         ])
+
 
         return partition_device
     
