@@ -11,7 +11,6 @@ import tempfile
 import tarfile
 from typing import List, Dict, Optional, Tuple
 from dxf import DXF
-import requests
 
 
 class DockerRegistryClient:
@@ -35,6 +34,10 @@ class DockerRegistryClient:
         self.password = password
         self.insecure = insecure
         
+        # Configure for insecure connections if needed (must be set before DXF is constructed)
+        if insecure:
+            os.environ['DXF_INSECURE'] = '1'
+
         # Set up authentication function
         def auth_func(dxf_obj, response):
             if self.username and self.password:
@@ -44,10 +47,6 @@ class DockerRegistryClient:
                 dxf_obj.authenticate(response=response)
         
         self.dxf = DXF(self.registry_url, self.repository, auth_func)
-        
-        # Configure for insecure connections if needed
-        if insecure:
-            os.environ['DXF_INSECURE'] = '1'
     
     @staticmethod
     def parse_image_url(image_url: str) -> Tuple[str, str, str]:
@@ -140,33 +139,64 @@ class DockerRegistryClient:
         
         os.makedirs(output_dir, exist_ok=True)
         
-        # Get the manifest
+        # Get the manifest (may be an image manifest or a manifest list/index)
         manifest = self.get_manifest(tag)
-        
-        # Handle multi-platform manifest lists
-        if isinstance(manifest, dict) and platform in manifest:
-            # This is a multi-platform manifest list, get the specific platform
-            platform_manifest_str = manifest[platform]
-            manifest = json.loads(platform_manifest_str)
-            print(f"Using platform-specific manifest for {platform}")
+
+        def parse_platform(p: str) -> Dict[str, Optional[str]]:
+            parts = p.split('/')
+            os_name = parts[0] if parts else 'linux'
+            arch = parts[1] if len(parts) > 1 else 'amd64'
+            variant = parts[2] if len(parts) > 2 else None
+            return {'os': os_name, 'architecture': arch, 'variant': variant}
+
+        # If this is a manifest list (multi-arch), select the requested platform
+        media_type = manifest.get('mediaType', '') if isinstance(manifest, dict) else ''
+        if isinstance(manifest, dict) and ('manifests' in manifest or 'application/vnd.docker.distribution.manifest.list.v2+json' in media_type or 'application/vnd.oci.image.index.v1+json' in media_type):
+            target = parse_platform(platform)
+            manifests = manifest.get('manifests', [])
+            selected = None
+            for m in manifests:
+                plat = m.get('platform', {})
+                if not plat:
+                    continue
+                if plat.get('os') == target['os'] and plat.get('architecture') == target['architecture']:
+                    if target['variant'] is None or plat.get('variant') == target['variant']:
+                        selected = m
+                        break
+            if not selected:
+                raise Exception(f"No manifest found for platform {platform}")
+            digest = selected.get('digest')
+            if not digest:
+                raise Exception("Selected platform manifest missing digest")
+            # Fetch the platform-specific manifest by digest
+            try:
+                manifest = self.get_manifest(digest)
+            except Exception as e:
+                raise Exception(f"Failed to fetch platform-specific manifest {digest}: {str(e)}")
+            print(f"Using platform-specific manifest for {platform} ({digest})")
         
         # Handle different manifest formats
         if manifest.get('schemaVersion') == 2:
             if 'layers' in manifest:
-                # Schema 2 format
+                # OCI/Docker schema2 format
                 layers = manifest['layers']
             elif 'fsLayers' in manifest:
                 # Schema 1 format
                 layers = [{'digest': layer['blobSum']} for layer in manifest['fsLayers']]
             else:
-                raise Exception("Unsupported manifest format")
+                raise Exception("Unsupported manifest format: missing layers")
         else:
             raise Exception(f"Unsupported manifest schema version: {manifest.get('schemaVersion')}")
         
         downloaded_layers = []
         
         for i, layer in enumerate(layers):
-            digest = layer['digest']
+            digest = layer.get('digest')
+            if not digest:
+                # Some schema 1 entries may use blobSum
+                digest = layer.get('blobSum')
+            if not digest:
+                raise Exception("Layer entry missing digest")
             layer_filename = f"layer_{i:03d}_{digest.replace(':', '_')}.tar"
             layer_path = os.path.join(output_dir, layer_filename)
             
@@ -190,7 +220,8 @@ class DockerRegistryClient:
             print(f"Extracting layer {i+1}/{len(layer_paths)}: {os.path.basename(layer_path)}")
             
             try:
-                with tarfile.open(layer_path, 'r') as tar:
+                # Auto-detect compression (gz, zstd, etc.)
+                with tarfile.open(layer_path, 'r:*') as tar:
                     # Extract all files, preserving permissions and ownership where possible
                     tar.extractall(path=rootfs_dir, numeric_owner=True)
             except Exception as e:

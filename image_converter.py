@@ -76,11 +76,18 @@ class ImageConverter:
         """
         print(f"Creating disk image: {output_path} ({self.image_size_mb}MB)")
         
-        # Create sparse file
-        self.run_command([
-            'dd', 'if=/dev/zero', f'of={output_path}', 
-            'bs=1M', f'count={self.image_size_mb}', 'status=progress'
-        ])
+        # Create sparse file quickly; try fallocate, then truncate, then dd as fallback
+        try:
+            self.run_command(['fallocate', '-l', f'{self.image_size_mb}M', output_path])
+        except Exception:
+            try:
+                self.run_command(['truncate', '-s', f'{self.image_size_mb}M', output_path])
+            except Exception:
+                # Fallback to dd creating a sparse file (no data written)
+                self.run_command([
+                    'dd', 'if=/dev/zero', f'of={output_path}',
+                    'bs=1M', 'count=0', f'seek={self.image_size_mb}'
+                ])
         
         return output_path
     

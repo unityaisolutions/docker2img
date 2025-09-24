@@ -10,7 +10,6 @@ import tempfile
 import traceback
 from typing import Optional, Tuple
 import threading
-import time
 
 from docker_registry import DockerRegistryClient
 from image_converter import ImageConverter
@@ -199,8 +198,7 @@ class DockerToBootableApp:
                     
                     convert_btn = gr.Button(
                         "🚀 Convert to Bootable Image",
-                        variant="primary",
-                        size="lg"
+                        variant="primary"
                     )
                 
                 with gr.Column(scale=1):
@@ -255,9 +253,9 @@ class DockerToBootableApp:
             def handle_conversion(*args):
                 status, file_path = self.convert_docker_image(*args)
                 if file_path and os.path.exists(file_path):
-                    return status, gr.File(value=file_path, visible=True)
+                    return status, gr.update(value=file_path, visible=True)
                 else:
-                    return status, gr.File(visible=False)
+                    return status, gr.update(value=None, visible=False)
             
             convert_btn.click(
                 fn=handle_conversion,
