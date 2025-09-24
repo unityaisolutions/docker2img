@@ -1,0 +1,12 @@
+# Docker to Bootable Image Converter - Python Dependencies
+
+# Core web framework
+gradio
+
+# Docker registry API client
+python-dxf
+
+# Additional dependencies (automatically installed with above)
+# requests>=2.25.0
+# urllib3>=1.26.0
+# www-authenticate>=0.9.0

@@ -1,0 +1,72 @@
+# Docker Compose configuration for Docker to Bootable Image Converter
+
+version: '3.8'
+
+services:
+  docker-to-bootable:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: docker-to-bootable-converter
+    ports:
+      - "7860:7860"
+    volumes:
+      # Mount Docker socket to allow Docker operations (if needed)
+      # - /var/run/docker.sock:/var/run/docker.sock
+      
+      # Mount host directories for persistent storage
+      - ./output:/app/output
+      - ./temp:/tmp/conversion_temp
+    
+    # Required for disk operations
+    privileged: true
+    
+    # Additional capabilities for disk and mount operations
+    cap_add:
+      - SYS_ADMIN
+      - MKNOD
+      - SYS_DEVICES
+    
+    # Allow access to loop devices
+    devices:
+      - /dev/loop-control:/dev/loop-control
+      - /dev/loop0:/dev/loop0
+      - /dev/loop1:/dev/loop1
+      - /dev/loop2:/dev/loop2
+      - /dev/loop3:/dev/loop3
+      - /dev/loop4:/dev/loop4
+      - /dev/loop5:/dev/loop5
+      - /dev/loop6:/dev/loop6
+      - /dev/loop7:/dev/loop7
+    
+    environment:
+      - PYTHONUNBUFFERED=1
+      - GRADIO_SERVER_NAME=0.0.0.0
+      - GRADIO_SERVER_PORT=7860
+    
+    restart: unless-stopped
+    
+    # Resource limits (adjust based on your needs)
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: '2.0'
+        reservations:
+          memory: 1G
+          cpus: '0.5'
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7860/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+# Create named volumes for persistent data
+volumes:
+  output:
+    driver: local
+  temp:
+    driver: local
