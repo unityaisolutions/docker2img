@@ -109,17 +109,32 @@ class ImageConverter:
         except Exception as e:
             print(f"ERROR: Cannot get disk image size: {e}")
 
-        # Create loop device
+        # Create loop device with retry logic
         print(f"DEBUG: Creating loop device for {disk_path}")
-        result = self.run_command(['sudo', 'losetup', '--find', '--show', disk_path])
-        loop_device = result.stdout.strip()
-        self.loop_devices.append(loop_device)
-
-        print(f"DEBUG: Created loop device: {loop_device}")
-
-        # Verify loop device was created successfully
+        loop_device = None
+        max_retries = 3
+        
+        for attempt in range(max_retries):
+            try:
+                result = self.run_command(['sudo', 'losetup', '--find', '--show', disk_path])
+                loop_device = result.stdout.strip()
+                
+                if loop_device and os.path.exists(loop_device):
+                    self.loop_devices.append(loop_device)
+                    print(f"DEBUG: Created loop device: {loop_device}")
+                    break
+                else:
+                    print(f"DEBUG: Attempt {attempt + 1}: Loop device creation returned '{loop_device}' but device doesn't exist")
+                    
+            except Exception as e:
+                print(f"DEBUG: Attempt {attempt + 1} failed: {e}")
+                if attempt == max_retries - 1:
+                    raise
+                import time
+                time.sleep(1)
+        
         if not loop_device or not os.path.exists(loop_device):
-            raise Exception(f"Failed to create loop device for {disk_path}")
+            raise Exception(f"Failed to create loop device for {disk_path} after {max_retries} attempts")
 
         # Create partition table and partition using parted
         print(f"DEBUG: Creating partition table and partition on {loop_device}")

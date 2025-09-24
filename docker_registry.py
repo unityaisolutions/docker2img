@@ -100,11 +100,41 @@ class DockerRegistryClient:
         """
         try:
             manifest_data = self.dxf.get_manifest(tag)
-            # dxf.get_manifest() returns a dict, not a JSON string
+            print(f"DEBUG: Raw manifest type: {type(manifest_data)}")
+            
+            # Handle different return types from dxf
             if isinstance(manifest_data, dict):
-                return manifest_data
-            else:
+                print(f"DEBUG: Manifest is dict with keys: {list(manifest_data.keys())}")
+                # Check if this is a platform-specific manifest dict from DXF
+                if all(key.count('/') == 1 for key in manifest_data.keys() if isinstance(key, str)):
+                    # This looks like DXF's platform-specific format
+                    # Try to get the linux/amd64 manifest or first available
+                    platform_key = 'linux/amd64'
+                    if platform_key in manifest_data:
+                        print(f"DEBUG: Using platform-specific manifest for {platform_key}")
+                        platform_manifest = manifest_data[platform_key]
+                        if isinstance(platform_manifest, str):
+                            return json.loads(platform_manifest)
+                        else:
+                            return platform_manifest
+                    else:
+                        # Use first available platform
+                        first_key = next(iter(manifest_data.keys()))
+                        print(f"DEBUG: Platform linux/amd64 not found, using {first_key}")
+                        platform_manifest = manifest_data[first_key]
+                        if isinstance(platform_manifest, str):
+                            return json.loads(platform_manifest)
+                        else:
+                            return platform_manifest
+                else:
+                    # Regular manifest dict
+                    return manifest_data
+            elif isinstance(manifest_data, str):
+                print(f"DEBUG: Manifest is string, parsing JSON")
                 return json.loads(manifest_data)
+            else:
+                print(f"DEBUG: Unexpected manifest type: {type(manifest_data)}")
+                return manifest_data
         except Exception as e:
             raise Exception(f"Failed to get manifest for {self.repository}:{tag}: {str(e)}")
     
@@ -143,25 +173,51 @@ class DockerRegistryClient:
         # Get the manifest
         manifest = self.get_manifest(tag)
         
-        # Handle multi-platform manifest lists
-        if isinstance(manifest, dict) and platform in manifest:
-            # This is a multi-platform manifest list, get the specific platform
-            platform_manifest_str = manifest[platform]
-            manifest = json.loads(platform_manifest_str)
-            print(f"Using platform-specific manifest for {platform}")
+        # Handle manifest list (multi-platform)
+        if manifest.get('mediaType') == 'application/vnd.docker.distribution.manifest.list.v2+json':
+            # This is a manifest list, find the platform-specific manifest
+            platform_arch = platform.split('/')[-1] if '/' in platform else platform
+            platform_os = platform.split('/')[0] if '/' in platform else 'linux'
+            
+            for manifest_entry in manifest.get('manifests', []):
+                entry_platform = manifest_entry.get('platform', {})
+                if (entry_platform.get('architecture') == platform_arch and 
+                    entry_platform.get('os', 'linux') == platform_os):
+                    platform_digest = manifest_entry['digest']
+                    print(f"Found platform-specific manifest: {platform_digest}")
+                    # Get the platform-specific manifest
+                    manifest_data = self.dxf.get_manifest(platform_digest)
+                    if isinstance(manifest_data, dict):
+                        manifest = manifest_data
+                    else:
+                        manifest = json.loads(manifest_data)
+                    break
+            else:
+                print(f"Warning: Platform {platform} not found, using first available manifest")
+                if manifest.get('manifests'):
+                    platform_digest = manifest['manifests'][0]['digest']
+                    manifest_data = self.dxf.get_manifest(platform_digest)
+                    if isinstance(manifest_data, dict):
+                        manifest = manifest_data
+                    else:
+                        manifest = json.loads(manifest_data)
         
         # Handle different manifest formats
+        layers = []
         if manifest.get('schemaVersion') == 2:
             if 'layers' in manifest:
-                # Schema 2 format
+                # Schema 2 format (most common)
                 layers = manifest['layers']
             elif 'fsLayers' in manifest:
-                # Schema 1 format
+                # Schema 1 format (legacy)
                 layers = [{'digest': layer['blobSum']} for layer in manifest['fsLayers']]
-            else:
-                raise Exception("Unsupported manifest format")
-        else:
-            raise Exception(f"Unsupported manifest schema version: {manifest.get('schemaVersion')}")
+        elif manifest.get('schemaVersion') == 1:
+            # Schema 1 format
+            if 'fsLayers' in manifest:
+                layers = [{'digest': layer['blobSum']} for layer in manifest['fsLayers']]
+        
+        if not layers:
+            raise Exception(f"No layers found in manifest. Schema version: {manifest.get('schemaVersion')}, Keys: {list(manifest.keys())}")
         
         downloaded_layers = []
         
@@ -197,17 +253,46 @@ class DockerRegistryClient:
                 print(f"Warning: Failed to extract layer {layer_path}: {str(e)}")
                 continue
     
-    def get_image_info(self, tag: str = 'latest') -> Dict:
+    def get_image_info(self, tag: str = 'latest', platform: str = 'linux/amd64') -> Dict:
         """
         Get basic information about the image.
         
         Args:
             tag: The image tag to inspect
+            platform: Platform to get info for (in case of manifest lists)
             
         Returns:
             Dictionary with image information
         """
         manifest = self.get_manifest(tag)
+        
+        # Handle manifest list (multi-platform)
+        if manifest.get('mediaType') == 'application/vnd.docker.distribution.manifest.list.v2+json':
+            # This is a manifest list, find the platform-specific manifest
+            platform_arch = platform.split('/')[-1] if '/' in platform else platform
+            platform_os = platform.split('/')[0] if '/' in platform else 'linux'
+            
+            for manifest_entry in manifest.get('manifests', []):
+                entry_platform = manifest_entry.get('platform', {})
+                if (entry_platform.get('architecture') == platform_arch and 
+                    entry_platform.get('os', 'linux') == platform_os):
+                    platform_digest = manifest_entry['digest']
+                    # Get the platform-specific manifest
+                    manifest_data = self.dxf.get_manifest(platform_digest)
+                    if isinstance(manifest_data, dict):
+                        manifest = manifest_data
+                    else:
+                        manifest = json.loads(manifest_data)
+                    break
+            else:
+                # Use first available manifest if platform not found
+                if manifest.get('manifests'):
+                    platform_digest = manifest['manifests'][0]['digest']
+                    manifest_data = self.dxf.get_manifest(platform_digest)
+                    if isinstance(manifest_data, dict):
+                        manifest = manifest_data
+                    else:
+                        manifest = json.loads(manifest_data)
         
         info = {
             'registry': self.registry_url,
@@ -218,11 +303,13 @@ class DockerRegistryClient:
             'total_size': 0
         }
         
+        # Count layers and calculate total size
         if 'layers' in manifest:
             info['layer_count'] = len(manifest['layers'])
             info['total_size'] = sum(layer.get('size', 0) for layer in manifest['layers'])
         elif 'fsLayers' in manifest:
             info['layer_count'] = len(manifest['fsLayers'])
+            # Schema 1 doesn't include size info in the manifest
         
         return info
 
