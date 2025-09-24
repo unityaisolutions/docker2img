@@ -87,62 +87,171 @@ class ImageConverter:
     def partition_disk(self, disk_path: str) -> str:
         """
         Create a partition table and primary partition on the disk.
-        
+
         Args:
             disk_path: Path to the disk image file
-            
+
         Returns:
             Path to the loop device
         """
         print(f"Partitioning disk: {disk_path}")
-        
+
+        # Check if disk image exists
+        print(f"DEBUG: Checking if disk image exists: {disk_path}")
+        if not os.path.exists(disk_path):
+            raise Exception(f"Disk image {disk_path} does not exist")
+
+        # Check disk image size
+        try:
+            size_bytes = os.path.getsize(disk_path)
+            size_mb = size_bytes / (1024 * 1024)
+            print(f"DEBUG: Disk image size: {size_mb:.1f}MB")
+        except Exception as e:
+            print(f"ERROR: Cannot get disk image size: {e}")
+
         # Create loop device
+        print(f"DEBUG: Creating loop device for {disk_path}")
         result = self.run_command(['sudo', 'losetup', '--find', '--show', disk_path])
         loop_device = result.stdout.strip()
         self.loop_devices.append(loop_device)
-        
-        print(f"Created loop device: {loop_device}")
-        
+
+        print(f"DEBUG: Created loop device: {loop_device}")
+
+        # Verify loop device was created successfully
+        if not loop_device or not os.path.exists(loop_device):
+            raise Exception(f"Failed to create loop device for {disk_path}")
+
         # Create partition table and partition using parted
+        print(f"DEBUG: Creating partition table and partition on {loop_device}")
         self.run_command([
             'sudo', 'parted', loop_device, '--script',
             'mklabel', 'msdos',
             'mkpart', 'primary', 'ext4', '1MiB', '100%',
             'set', '1', 'boot', 'on'
         ])
-        
+
         # Inform kernel about partition changes
+        print(f"DEBUG: Running partprobe on {loop_device}")
         self.run_command(['sudo', 'partprobe', loop_device])
-        
+
+        # Additional verification after partitioning
+        print(f"DEBUG: Verifying partition was created")
+        try:
+            # Check partition table
+            partprobe_result = subprocess.run(['sudo', 'parted', loop_device, 'print'],
+                                            capture_output=True, text=True)
+            print(f"DEBUG: Partition table info:\n{partprobe_result.stdout}")
+            if partprobe_result.stderr:
+                print(f"DEBUG: parted stderr: {partprobe_result.stderr}")
+        except Exception as e:
+            print(f"ERROR: Cannot verify partition table: {e}")
+
         return loop_device
     
     def format_partition(self, loop_device: str) -> str:
         """
         Format the partition with ext4 filesystem.
-        
+
         Args:
             loop_device: Path to the loop device
-            
+
         Returns:
             Path to the partition device
         """
         partition_device = f"{loop_device}p1"
-        
+
         print(f"Formatting partition: {partition_device}")
-        
-        # Wait for partition device to appear
-        for i in range(10):
+
+        # Check if loop device exists
+        print(f"DEBUG: Checking if loop device exists: {loop_device}")
+        if not os.path.exists(loop_device):
+            print(f"ERROR: Loop device {loop_device} does not exist!")
+            raise Exception(f"Loop device {loop_device} does not exist")
+
+        # Check loop device permissions
+        try:
+            stat_info = os.stat(loop_device)
+            print(f"DEBUG: Loop device permissions: {oct(stat_info.st_mode)}, owned by: {stat_info.st_uid}:{stat_info.st_gid}")
+        except Exception as e:
+            print(f"ERROR: Cannot stat loop device: {e}")
+
+        # Check available loop devices
+        try:
+            result = subprocess.run(['losetup', '-l'], capture_output=True, text=True)
+            print(f"DEBUG: Available loop devices:\n{result.stdout}")
+        except Exception as e:
+            print(f"ERROR: Cannot list loop devices: {e}")
+
+        # Check if partition device already exists before waiting
+        print(f"DEBUG: Checking if partition device already exists: {partition_device}")
+        if os.path.exists(partition_device):
+            print(f"DEBUG: Partition device already exists!")
+            # Format with ext4
+            self.run_command([
+                'sudo', 'mkfs.ext4', '-F', partition_device
+            ])
+            return partition_device
+
+        # Try partprobe first
+        print(f"DEBUG: Running partprobe on {loop_device}")
+        try:
+            partprobe_result = subprocess.run(['sudo', 'partprobe', loop_device],
+                                            capture_output=True, text=True)
+            print(f"DEBUG: partprobe stdout: {partprobe_result.stdout}")
+            print(f"DEBUG: partprobe stderr: {partprobe_result.stderr}")
+            print(f"DEBUG: partprobe return code: {partprobe_result.returncode}")
+        except Exception as e:
+            print(f"ERROR: partprobe failed: {e}")
+
+        # Wait for partition device to appear with more detailed logging
+        print(f"DEBUG: Waiting for partition device {partition_device} to appear...")
+        max_attempts = 15  # Increased from 10 to 15 seconds
+        for i in range(max_attempts):
+            print(f"DEBUG: Attempt {i+1}/{max_attempts}: Checking for {partition_device}")
             if os.path.exists(partition_device):
+                print(f"DEBUG: SUCCESS! Partition device appeared after {i+1} seconds")
                 break
+
+            # Check if any partition devices exist for this loop device
+            try:
+                ls_result = subprocess.run(['ls', '-la', f"{loop_device}p*"],
+                                         capture_output=True, text=True)
+                if ls_result.stdout.strip():
+                    print(f"DEBUG: Found partition devices:\n{ls_result.stdout}")
+                else:
+                    print(f"DEBUG: No partition devices found yet")
+            except:
+                pass
+
             time.sleep(1)
         else:
-            raise Exception(f"Partition device {partition_device} did not appear")
-        
+            # Partition device still didn't appear
+            print(f"ERROR: Partition device {partition_device} did not appear after {max_attempts} seconds")
+
+            # Additional diagnostic information
+            try:
+                print("DEBUG: Checking /dev/loop* devices:")
+                ls_dev_result = subprocess.run(['ls', '-la', '/dev/loop*'],
+                                             capture_output=True, text=True)
+                print(ls_dev_result.stdout)
+            except:
+                pass
+
+            try:
+                print("DEBUG: Checking /proc/partitions:")
+                cat_result = subprocess.run(['cat', '/proc/partitions'],
+                                          capture_output=True, text=True)
+                print(cat_result.stdout)
+            except:
+                pass
+
+            raise Exception(f"Partition device {partition_device} did not appear after {max_attempts} seconds")
+
         # Format with ext4
         self.run_command([
             'sudo', 'mkfs.ext4', '-F', partition_device
         ])
-        
+
         return partition_device
     
     def mount_partition(self, partition_device: str) -> str:
