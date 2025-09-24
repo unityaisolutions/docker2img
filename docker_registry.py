@@ -9,7 +9,7 @@ import os
 import json
 import tempfile
 import tarfile
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Any
 from dxf import DXF
 import requests
 
@@ -88,13 +88,15 @@ class DockerRegistryClient:
             
         return registry_url, repository, tag
     
-    def get_manifest(self, tag: str = 'latest') -> Dict:
+    def get_manifest(self, tag: str = 'latest', platform: Optional[str] = None) -> Dict:
         """
         Get the image manifest for the specified tag.
         
         Args:
             tag: The image tag to retrieve
-            
+            platform: Optional platform (e.g., 'linux/amd64', 'linux/arm/v7') used when DXF returns a
+                      platform-keyed manifest map
+        
         Returns:
             The parsed manifest as a dictionary
         """
@@ -102,42 +104,86 @@ class DockerRegistryClient:
             manifest_data = self.dxf.get_manifest(tag)
             print(f"DEBUG: Raw manifest type: {type(manifest_data)}")
             
-            # Handle different return types from dxf
+            # Normalize string to dict
+            if isinstance(manifest_data, str):
+                print("DEBUG: Manifest is string, parsing JSON")
+                manifest_data = json.loads(manifest_data)
+            
             if isinstance(manifest_data, dict):
-                print(f"DEBUG: Manifest is dict with keys: {list(manifest_data.keys())}")
-                # Check if this is a platform-specific manifest dict from DXF
-                if all(key.count('/') == 1 for key in manifest_data.keys() if isinstance(key, str)):
-                    # This looks like DXF's platform-specific format
-                    # Try to get the linux/amd64 manifest or first available
-                    platform_key = 'linux/amd64'
-                    if platform_key in manifest_data:
-                        print(f"DEBUG: Using platform-specific manifest for {platform_key}")
-                        platform_manifest = manifest_data[platform_key]
-                        if isinstance(platform_manifest, str):
-                            return json.loads(platform_manifest)
-                        else:
-                            return platform_manifest
-                    else:
-                        # Use first available platform
-                        first_key = next(iter(manifest_data.keys()))
-                        print(f"DEBUG: Platform linux/amd64 not found, using {first_key}")
-                        platform_manifest = manifest_data[first_key]
-                        if isinstance(platform_manifest, str):
-                            return json.loads(platform_manifest)
-                        else:
-                            return platform_manifest
-                else:
-                    # Regular manifest dict
+                keys = [k for k in manifest_data.keys() if isinstance(k, str)]
+                print(f"DEBUG: Manifest is dict with keys: {keys}")
+                
+                # If this is a manifest list/index (has 'manifests' array), return as-is.
+                if 'manifests' in manifest_data:
                     return manifest_data
-            elif isinstance(manifest_data, str):
-                print(f"DEBUG: Manifest is string, parsing JSON")
-                return json.loads(manifest_data)
-            else:
-                print(f"DEBUG: Unexpected manifest type: {type(manifest_data)}")
+                
+                # If this looks like a platform-keyed map returned by DXF, resolve to the requested platform.
+                # Example keys: 'linux/amd64', 'linux/arm/v7', 'linux/arm64/v8', 'unknown/unknown'
+                platform_map_like = (
+                    len(keys) > 0 and
+                    all('/' in k for k in keys) and
+                    not any(k in ('schemaVersion', 'mediaType', 'layers', 'fsLayers') for k in keys)
+                )
+                if platform_map_like:
+                    resolved = self._resolve_platform_manifest_map(manifest_data, platform)
+                    return resolved
+                
+                # Otherwise assume this is already a concrete manifest dict
                 return manifest_data
+            
+            # Unexpected - return as-is (caller will handle)
+            print(f"DEBUG: Unexpected manifest type after normalization: {type(manifest_data)}")
+            return manifest_data
         except Exception as e:
             raise Exception(f"Failed to get manifest for {self.repository}:{tag}: {str(e)}")
     
+    def _resolve_platform_manifest_map(self, manifest_map: Dict[str, Any], platform: Optional[str]) -> Dict:
+        """
+        Resolve a DXF platform-keyed manifest map into a concrete manifest dict.
+        Preference order:
+          1) Exact platform match (e.g., linux/arm/v7)
+          2) OS/arch prefix match (e.g., requested linux/arm matches linux/arm/v7)
+          3) Fallback to linux/amd64 if present
+          4) First available key
+        """
+        keys = [k for k in manifest_map.keys() if isinstance(k, str)]
+        requested = platform or 'linux/amd64'
+        
+        # Helpers
+        def load_manifest(val: Any) -> Dict:
+            if isinstance(val, str):
+                try:
+                    return json.loads(val)
+                except Exception:
+                    # If string isn't JSON, let caller see raw
+                    return {'raw': val}
+            elif isinstance(val, dict):
+                return val
+            else:
+                return {'raw': val}
+        
+        # 1) Exact match
+        if requested in manifest_map:
+            print(f"DEBUG: Using platform-specific manifest for {requested}")
+            return load_manifest(manifest_map[requested])
+        
+        # 2) Prefix match (e.g., requested 'linux/arm64' matches 'linux/arm64/v8')
+        prefix_matches = [k for k in keys if k.startswith(requested + '/')]
+        if prefix_matches:
+            chosen = prefix_matches[0]
+            print(f"DEBUG: Using closest platform match: {chosen} for requested {requested}")
+            return load_manifest(manifest_map[chosen])
+        
+        # 3) Fallback to linux/amd64
+        if 'linux/amd64' in manifest_map:
+            print("DEBUG: Requested platform not found, falling back to linux/amd64")
+            return load_manifest(manifest_map['linux/amd64'])
+        
+        # 4) Final fallback: first key
+        first_key = keys[0]
+        print(f"DEBUG: Requested platform not found, using first available: {first_key}")
+        return load_manifest(manifest_map[first_key])
+
     def download_layer(self, digest: str, output_path: str) -> None:
         """
         Download a specific layer by its digest.
@@ -170,54 +216,74 @@ class DockerRegistryClient:
         
         os.makedirs(output_dir, exist_ok=True)
         
-        # Get the manifest
-        manifest = self.get_manifest(tag)
+        # Get the manifest (pass platform so DXF platform maps are resolved)
+        manifest = self.get_manifest(tag, platform)
         
-        # Handle manifest list (multi-platform)
-        if manifest.get('mediaType') == 'application/vnd.docker.distribution.manifest.list.v2+json':
-            # This is a manifest list, find the platform-specific manifest
-            platform_arch = platform.split('/')[-1] if '/' in platform else platform
-            platform_os = platform.split('/')[0] if '/' in platform else 'linux'
+        # Handle manifest list (Docker V2 list and OCI index) and also fallback if 'manifests' key exists
+        media_type = manifest.get('mediaType')
+        if media_type in (
+            'application/vnd.docker.distribution.manifest.list.v2+json',
+            'application/vnd.oci.image.index.v1+json'
+        ) or 'manifests' in manifest:
+            # Parse requested platform into os/arch[/variant]
+            tokens = platform.split('/') if platform else ['linux', 'amd64']
+            platform_os = tokens[0] if len(tokens) > 0 else 'linux'
+            platform_arch = tokens[1] if len(tokens) > 1 else 'amd64'
+            platform_variant = tokens[2] if len(tokens) > 2 else None
             
+            chosen_digest = None
             for manifest_entry in manifest.get('manifests', []):
                 entry_platform = manifest_entry.get('platform', {})
-                if (entry_platform.get('architecture') == platform_arch and 
-                    entry_platform.get('os', 'linux') == platform_os):
-                    platform_digest = manifest_entry['digest']
-                    print(f"Found platform-specific manifest: {platform_digest}")
-                    # Get the platform-specific manifest
-                    manifest_data = self.dxf.get_manifest(platform_digest)
-                    if isinstance(manifest_data, dict):
-                        manifest = manifest_data
-                    else:
-                        manifest = json.loads(manifest_data)
+                if (entry_platform.get('os') == platform_os and
+                    entry_platform.get('architecture') == platform_arch and
+                    (platform_variant is None or entry_platform.get('variant') == platform_variant)):
+                    chosen_digest = manifest_entry.get('digest')
                     break
-            else:
-                print(f"Warning: Platform {platform} not found, using first available manifest")
-                if manifest.get('manifests'):
-                    platform_digest = manifest['manifests'][0]['digest']
-                    manifest_data = self.dxf.get_manifest(platform_digest)
-                    if isinstance(manifest_data, dict):
-                        manifest = manifest_data
-                    else:
-                        manifest = json.loads(manifest_data)
+            # Fallback: match os/arch ignoring variant
+            if not chosen_digest and platform_variant:
+                for manifest_entry in manifest.get('manifests', []):
+                    entry_platform = manifest_entry.get('platform', {})
+                    if (entry_platform.get('os') == platform_os and
+                        entry_platform.get('architecture') == platform_arch):
+                        chosen_digest = manifest_entry.get('digest')
+                        break
+            # Final fallback: first available
+            if not chosen_digest and manifest.get('manifests'):
+                print(f"Warning: Platform {platform} not found in manifest list; using first available")
+                chosen_digest = manifest['manifests'][0].get('digest')
+            
+            if chosen_digest:
+                print(f"Selected platform-specific manifest: {chosen_digest}")
+                manifest_data = self.dxf.get_manifest(chosen_digest)
+                if isinstance(manifest_data, dict):
+                    manifest = manifest_data
+                else:
+                    manifest = json.loads(manifest_data)
         
         # Handle different manifest formats
-        layers = []
-        if manifest.get('schemaVersion') == 2:
+        layers: List[Dict[str, Any]] = []
+        schema_version = manifest.get('schemaVersion')
+        if schema_version == 2 or media_type == 'application/vnd.oci.image.manifest.v1+json':
             if 'layers' in manifest:
-                # Schema 2 format (most common)
+                # Schema 2 (Docker) or OCI manifest
                 layers = manifest['layers']
             elif 'fsLayers' in manifest:
-                # Schema 1 format (legacy)
-                layers = [{'digest': layer['blobSum']} for layer in manifest['fsLayers']]
-        elif manifest.get('schemaVersion') == 1:
-            # Schema 1 format
+                # Some edge cases present schema 1 keys with schemaVersion 2 incorrectly
+                layers = [{'digest': layer['blobSum']} for layer in manifest.get('fsLayers', [])]
+        elif schema_version == 1:
             if 'fsLayers' in manifest:
                 layers = [{'digest': layer['blobSum']} for layer in manifest['fsLayers']]
         
         if not layers:
-            raise Exception(f"No layers found in manifest. Schema version: {manifest.get('schemaVersion')}, Keys: {list(manifest.keys())}")
+            # Improve diagnostics for troubleshooting
+            keys = list(manifest.keys())
+            mt = manifest.get('mediaType')
+            raise Exception(
+                "No layers found in manifest. "
+                f"Schema version: {schema_version}, MediaType: {mt}, Keys: {keys}. "
+                "Hint: If Keys look like platform strings (e.g., 'linux/arm/v7'), the registry "
+                "returned a platform map; ensure platform selection resolved to a concrete manifest."
+            )
         
         downloaded_layers = []
         
@@ -264,35 +330,43 @@ class DockerRegistryClient:
         Returns:
             Dictionary with image information
         """
-        manifest = self.get_manifest(tag)
+        manifest = self.get_manifest(tag, platform)
         
-        # Handle manifest list (multi-platform)
-        if manifest.get('mediaType') == 'application/vnd.docker.distribution.manifest.list.v2+json':
-            # This is a manifest list, find the platform-specific manifest
-            platform_arch = platform.split('/')[-1] if '/' in platform else platform
-            platform_os = platform.split('/')[0] if '/' in platform else 'linux'
+        # Handle manifest list (multi-platform: Docker V2 list or OCI index)
+        media_type = manifest.get('mediaType')
+        if media_type in (
+            'application/vnd.docker.distribution.manifest.list.v2+json',
+            'application/vnd.oci.image.index.v1+json'
+        ) or 'manifests' in manifest:
+            tokens = platform.split('/') if platform else ['linux', 'amd64']
+            platform_os = tokens[0] if len(tokens) > 0 else 'linux'
+            platform_arch = tokens[1] if len(tokens) > 1 else 'amd64'
+            platform_variant = tokens[2] if len(tokens) > 2 else None
             
+            chosen_digest = None
             for manifest_entry in manifest.get('manifests', []):
                 entry_platform = manifest_entry.get('platform', {})
-                if (entry_platform.get('architecture') == platform_arch and 
-                    entry_platform.get('os', 'linux') == platform_os):
-                    platform_digest = manifest_entry['digest']
-                    # Get the platform-specific manifest
-                    manifest_data = self.dxf.get_manifest(platform_digest)
-                    if isinstance(manifest_data, dict):
-                        manifest = manifest_data
-                    else:
-                        manifest = json.loads(manifest_data)
+                if (entry_platform.get('os') == platform_os and
+                    entry_platform.get('architecture') == platform_arch and
+                    (platform_variant is None or entry_platform.get('variant') == platform_variant)):
+                    chosen_digest = manifest_entry.get('digest')
                     break
-            else:
-                # Use first available manifest if platform not found
-                if manifest.get('manifests'):
-                    platform_digest = manifest['manifests'][0]['digest']
-                    manifest_data = self.dxf.get_manifest(platform_digest)
-                    if isinstance(manifest_data, dict):
-                        manifest = manifest_data
-                    else:
-                        manifest = json.loads(manifest_data)
+            if not chosen_digest and platform_variant:
+                for manifest_entry in manifest.get('manifests', []):
+                    entry_platform = manifest_entry.get('platform', {})
+                    if (entry_platform.get('os') == platform_os and
+                        entry_platform.get('architecture') == platform_arch):
+                        chosen_digest = manifest_entry.get('digest')
+                        break
+            if not chosen_digest and manifest.get('manifests'):
+                chosen_digest = manifest['manifests'][0].get('digest')
+            
+            if chosen_digest:
+                manifest_data = self.dxf.get_manifest(chosen_digest)
+                if isinstance(manifest_data, dict):
+                    manifest = manifest_data
+                else:
+                    manifest = json.loads(manifest_data)
         
         info = {
             'registry': self.registry_url,
