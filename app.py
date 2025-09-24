@@ -78,7 +78,7 @@ class DockerToBootableApp:
                 
                 # Get image information
                 try:
-                    image_info = client.get_image_info(tag)
+                    image_info = client.get_image_info(tag, platform)
                     progress(0.25, desc=f"Found image with {image_info['layer_count']} layers")
                 except Exception as e:
                     return f"❌ Error getting image info: {str(e)}", None
