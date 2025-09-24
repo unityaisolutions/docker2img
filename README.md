@@ -59,7 +59,7 @@ pip3 install -r requirements.txt
 
 #### Start the Application
 ```bash
-./start_app.sh
+bash start_app.sh
 # Or directly: python3 app.py
 ```
 
