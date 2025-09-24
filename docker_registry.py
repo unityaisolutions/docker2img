@@ -11,7 +11,13 @@ import tempfile
 import tarfile
 from typing import List, Dict, Optional, Tuple
 from dxf import DXF
-import requests
+from dxf.exceptions import (  # type: ignore[attr-defined]
+    DXFError,
+    DXFPlatformDataNotFound,
+    DXFUnexpectedStatusCodeError,
+    DXFUnsupportedSchemaType,
+    DXFUnexpectedError,
+)
 
 
 class DockerRegistryClient:
@@ -88,7 +94,124 @@ class DockerRegistryClient:
             
         return registry_url, repository, tag
     
-    def get_manifest(self, tag: str = 'latest') -> Dict:
+    def _get_platform_manifest(self, tag: str, platform: str) -> Dict:
+        """Retrieve the manifest for a specific platform from DXF.
+
+        This uses the DXF client's ``platform`` parameter to fetch the
+        platform-specific manifest and ensures the result is parsed to a
+        dictionary regardless of the underlying return type.
+
+        Args:
+            tag: The image tag or digest to retrieve.
+            platform: Platform string such as ``linux/amd64``.
+
+        Returns:
+            Parsed manifest as a dictionary.
+        """
+        try:
+            manifest_data = self.dxf.get_manifest(tag, platform=platform)
+        except DXFPlatformDataNotFound:
+            raise Exception(f"Platform {platform} not available for {self.repository}:{tag}")
+        except DXFUnsupportedSchemaType as exc:
+            raise Exception(f"Unsupported manifest schema for {self.repository}:{tag}: {exc}")
+        except DXFUnexpectedStatusCodeError as exc:
+            raise Exception(f"Registry returned unexpected status fetching manifest {tag}: {exc}")
+        except DXFUnexpectedError as exc:
+            raise Exception(f"Unexpected error fetching manifest {tag}: {exc}")
+        except DXFError as exc:
+            raise Exception(f"DXF error retrieving manifest {tag}: {exc}")
+        except Exception as exc:
+            raise Exception(f"Failed to retrieve manifest {tag} for platform {platform}: {exc}")
+
+        if isinstance(manifest_data, str):
+            try:
+                return json.loads(manifest_data)
+            except json.JSONDecodeError as exc:
+                raise Exception(f"Invalid manifest JSON for {self.repository}:{tag}@{platform}: {exc}")
+
+        if isinstance(manifest_data, dict):
+            return manifest_data
+
+        raise Exception(
+            f"Unsupported manifest type {type(manifest_data)} for {self.repository}:{tag}@{platform}"
+        )
+
+    def _resolve_manifest_for_platform(self, manifest: Dict, platform: str) -> Dict:
+        """Given a manifest or manifest list, produce the manifest for the platform."""
+        if not isinstance(manifest, dict):
+            raise Exception(f"Unexpected manifest type: {type(manifest)}")
+
+        # Already a schema manifest (not a list)
+        if manifest.get('schemaVersion') in (1, 2) and ('layers' in manifest or 'fsLayers' in manifest):
+            return manifest
+
+        # Manifest list handling
+        if manifest.get('manifests'):
+            target_os, _, target_arch = platform.partition('/')
+            if not target_arch:
+                target_arch = target_os
+                target_os = 'linux'
+
+            best_match = None
+            for entry in manifest.get('manifests', []):
+                entry_platform = entry.get('platform', {})
+                if (
+                    entry_platform.get('architecture') == target_arch
+                    and entry_platform.get('os', 'linux') == target_os
+                ):
+                    best_match = entry
+                    break
+
+            if best_match is None and manifest.get('manifests'):
+                best_match = manifest['manifests'][0]
+
+            if best_match is None:
+                raise Exception(
+                    f"Manifest list for {self.repository}:{manifest.get('tag', '<unknown>')} contains no entries"
+                )
+
+            digest = best_match.get('digest')
+            if not digest:
+                raise Exception("Manifest list entry missing digest")
+
+            media_type = best_match.get('mediaType')
+            next_platform = best_match.get('platform')
+            platform_str = (
+                f"{next_platform.get('os', 'linux')}/{next_platform.get('architecture')}"
+                if isinstance(next_platform, dict)
+                else platform
+            )
+
+            if media_type in (
+                'application/vnd.docker.distribution.manifest.list.v2+json',
+                'application/vnd.oci.image.index.v1+json',
+            ):
+                nested = self._get_platform_manifest(digest, platform_str)
+                return self._resolve_manifest_for_platform(nested, platform_str)
+
+            return self._get_platform_manifest(digest, platform_str)
+
+        # DXF multi-platform dict form (keys like linux/amd64)
+        platform_keys = [key for key in manifest.keys() if isinstance(key, str) and '/' in key]
+        if platform_keys and len(platform_keys) == len(manifest):
+            manifest_json = manifest.get(platform)
+            if manifest_json is None and platform_keys:
+                manifest_json = manifest.get(platform.replace('-', '/'))
+            if manifest_json is None and platform_keys:
+                manifest_json = manifest[platform_keys[0]]
+            if isinstance(manifest_json, str):
+                return json.loads(manifest_json)
+            if isinstance(manifest_json, dict):
+                return manifest_json
+            raise Exception(
+                f"Unsupported manifest map type {type(manifest_json)} for platform {platform}"
+            )
+
+        raise Exception(
+            f"Unable to resolve manifest for platform {platform}. Keys: {list(manifest.keys())}"
+        )
+
+    def get_manifest(self, tag: str = 'latest', platform: str = 'linux/amd64') -> Dict:
         """
         Get the image manifest for the specified tag.
         
@@ -101,40 +224,20 @@ class DockerRegistryClient:
         try:
             manifest_data = self.dxf.get_manifest(tag)
             print(f"DEBUG: Raw manifest type: {type(manifest_data)}")
-            
-            # Handle different return types from dxf
-            if isinstance(manifest_data, dict):
-                print(f"DEBUG: Manifest is dict with keys: {list(manifest_data.keys())}")
-                # Check if this is a platform-specific manifest dict from DXF
-                if all(key.count('/') == 1 for key in manifest_data.keys() if isinstance(key, str)):
-                    # This looks like DXF's platform-specific format
-                    # Try to get the linux/amd64 manifest or first available
-                    platform_key = 'linux/amd64'
-                    if platform_key in manifest_data:
-                        print(f"DEBUG: Using platform-specific manifest for {platform_key}")
-                        platform_manifest = manifest_data[platform_key]
-                        if isinstance(platform_manifest, str):
-                            return json.loads(platform_manifest)
-                        else:
-                            return platform_manifest
-                    else:
-                        # Use first available platform
-                        first_key = next(iter(manifest_data.keys()))
-                        print(f"DEBUG: Platform linux/amd64 not found, using {first_key}")
-                        platform_manifest = manifest_data[first_key]
-                        if isinstance(platform_manifest, str):
-                            return json.loads(platform_manifest)
-                        else:
-                            return platform_manifest
-                else:
-                    # Regular manifest dict
-                    return manifest_data
-            elif isinstance(manifest_data, str):
-                print(f"DEBUG: Manifest is string, parsing JSON")
-                return json.loads(manifest_data)
+
+            if isinstance(manifest_data, str):
+                manifest = json.loads(manifest_data)
+            elif isinstance(manifest_data, dict):
+                manifest = manifest_data
             else:
-                print(f"DEBUG: Unexpected manifest type: {type(manifest_data)}")
-                return manifest_data
+                raise Exception(f"Unexpected manifest type: {type(manifest_data)}")
+
+            resolved = self._resolve_manifest_for_platform(manifest, platform)
+            if not isinstance(resolved, dict):
+                raise Exception(
+                    f"Resolved manifest for {platform} has unexpected type {type(resolved)}"
+                )
+            return resolved
         except Exception as e:
             raise Exception(f"Failed to get manifest for {self.repository}:{tag}: {str(e)}")
     
@@ -171,7 +274,7 @@ class DockerRegistryClient:
         os.makedirs(output_dir, exist_ok=True)
         
         # Get the manifest
-        manifest = self.get_manifest(tag)
+        manifest = self.get_manifest(tag, platform)
         
         # Handle manifest list (multi-platform)
         if manifest.get('mediaType') == 'application/vnd.docker.distribution.manifest.list.v2+json':
@@ -264,7 +367,7 @@ class DockerRegistryClient:
         Returns:
             Dictionary with image information
         """
-        manifest = self.get_manifest(tag)
+        manifest = self.get_manifest(tag, platform)
         
         # Handle manifest list (multi-platform)
         if manifest.get('mediaType') == 'application/vnd.docker.distribution.manifest.list.v2+json':
